@@ -18,12 +18,14 @@ def query_ps1(ra,dec,radius,only_stars=False,version='dr2'):
         m = 'Version must be dr2, or dr1'
         raise ValueError(m)
     
-    str = f'https://catalogs.mast.stsci.edu/api/v0.1/panstarrs/{version.lower()}/mean?ra={ra}&dec={dec}&radius={radius}&nDetections.gte=1&pagesize=-1&format=csv'
+    url = f'https://catalogs.mast.stsci.edu/api/v0.1/panstarrs/{version.lower()}/mean?ra={ra}&dec={dec}&radius={radius}&nDetections.gte=1&pagesize=-1&format=csv'
+    # Changed to url as it was causing issues when doing str().
     try:
-        cat = pd.read_csv(str)
+        cat = pd.read_csv(url)
     except pd.errors.EmptyDataError:
         print('No detections')
         cat = []
+        return pd.DataFrame
     cat = isolate_stars(cat,only_stars=only_stars)
     return cat 
 
