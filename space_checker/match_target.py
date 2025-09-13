@@ -11,7 +11,7 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Ellipse
 import numpy as np
 import pandas as pd
-from scipy.signal import find_peaks
+from scipy.signal import find_peaks, convolve
 import heapq
 
 from matplotlib.markers import MarkerStyle
@@ -33,7 +33,7 @@ def identifier_creator(source, filename):
 
 	data = pd.read_csv(filename, names=["time_MJD", "counts", "event_flag"], skiprows=1).apply(pd.to_numeric, errors='coerce')
 	event_data = data[data["event_flag"] != 0.0]
-	MJD = event_data["time_MDJD"].iloc[0]
+	MJD = event_data["time_MJD"].iloc[0]
 
 	source_ra, source_dec = source[2], source[3]
 
@@ -94,7 +94,7 @@ class prob_association():
 
 		coords = [ra,dec]
 
-		fig, wcs, outsize, phot, cat = event_cutout(coords,error=error,size=imsize)
+		fig, wcs, outsize, phot, cat = event_cutout(coords,error=pos_error,size=imsize)
 
 		cat['g-r'] = cat['gmag'] - cat['rmag']
 
@@ -108,15 +108,15 @@ class prob_association():
 	def _compute_distance_prob(self,index=None):
 		if self.cat is None:
 			raise ValueError('No catalog is specified')
-		if len(ra) > 1:
+		if len(self.ra) > 1:
 			if index is None:
 				m = '!! Only 1 coordinate can be queried, and no index is set.\nSetting index = 0 !!'
 				warnings.warn(m)
 				index = 0
 		ra = self.ra[index]; dec = self.dec[index]; era = self.era[index]; edec = self.edec[index]
-		dist = np.sqrt((ra - cat['ra'].values)**2 + (dec - cat['dec'].values)**2)
-		dra = ((ra - cat['ra'].values) / era)**2
-		ddec = ((dec - cat['dec'].values) / edec)**2
+		dist = np.sqrt((ra - self.cat['ra'].values)**2 + (dec - self.cat['dec'].values)**2)
+		dra = ((ra - self.cat['ra'].values) / era)**2
+		ddec = ((dec - self.cat['dec'].values) / edec)**2
 		sig = np.exp(-1/2*(dra+ddec))
 		self.cat['dist'] = dist
 		self.cat['dist_sig'] = sig
@@ -180,8 +180,8 @@ class prob_association():
 		self.event_stats['fast'] =  self.event_stats['duration'].values < 2/24
 
 		active_star = self.event_stats['flaring'] & self.event_stats['fast']
-		self.event_stats['grb'].iloc[active_star] = 0.1
-		self.event_stats['flare'].iloc[active_star] = 0.9
+		#self.event_stats['grb'].iloc[active_star] = 0.1 As these lines aren't in the dataframe
+		#self.event_stats['flare'].iloc[active_star] = 0.9
 
 		nova = ~self.event_stats['fast']
 		self.event_stats['nova'].iloc[nova] = 1
