@@ -69,8 +69,9 @@ def _add_colored_sources(fig, coords, cat, top_3, error):
             objects = cat.loc[cat['star'] == star_type]
             norm = mcolors.Normalize(vmin=min(objects.final_probabilities), vmax=max(objects.final_probabilities))
             ax.scatter(objects.ra, objects.dec, transform=ax.get_transform('fk5'),
-                       edgecolors=cmap(norm(objects.final_probabilities)), marker=marker, s=80,
-                       facecolors='none', label=label)
+                       if not object.empty:
+                           edgecolors=cmap(norm(objects.final_probabilities)), marker=marker, s=80,
+                           facecolors='none', label=label)
 
         # colour highest chance
         ax.scatter(cat.iloc[top_3[0]].ra, cat.iloc[top_3[0]].dec, transform=ax.get_transform('fk5'),
@@ -176,5 +177,6 @@ def human_check(cat, indices, testcase, object_from_lightcurve, color_from_light
         print(f"Couldn't get colored figure: {e}")
 
     cat, transient_index = user_input(cat, transient_index)
+
 
     return cat, transient_index
