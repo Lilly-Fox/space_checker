@@ -166,7 +166,7 @@ def _Skymapper_phot(ra,dec,size):
             Time.sleep(1)
     if not complete:
         m = 'Failed to get SkyMapper'
-        raise(m)
+        raise Exception(m)
     t = table[(table['col16'] == 'main')]
     t_unique = t[~t.duplicated(subset='col3', keep='first')]
 
@@ -454,6 +454,7 @@ def event_cutout(coords,error=None,size=100,phot=None,check='gaia'):
             cat = simbad_sources(coords[0],coords[1],size/60**2)
         elif check == 'gaia':
             cat = get_gaia(coords[0],coords[1],size/60**2)
+
 
 
     return fig,wcs,outsize, phot, cat, image
