@@ -97,6 +97,7 @@ def tess_lightcurve(data):
     # Process the event data to identify the light curve type
     if event_data.empty:
         print("No event occurs!")
+        return None
     else:
         #Filter the entire dataset to return the events and some time surrounding it
         event_time, event_width = event_data["time_MDJD"].iloc[0], event_data["time_MDJD"].iloc[-1] - event_data["time_MDJD"].iloc[0]
