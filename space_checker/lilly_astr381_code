@@ -1,0 +1,660 @@
+"""I did this in a notebook, so ran the first section and had the second section in a separate cell. I tried to get rid of everything
+I didn't use, but there might still be some useless functions here."""
+
+import warnings
+from astropy import units as u
+from astropy.coordinates import SkyCoord
+import tessreduce as tr
+import matplotlib.pyplot as plt
+from matplotlib.patches import Ellipse
+import numpy as np
+import pandas as pd
+from scipy.signal import find_peaks, convolve
+import heapq
+from matplotlib.markers import MarkerStyle
+import matplotlib.colors as mcolors
+import os
+import csv
+import sys
+import warnings
+import re
+import requests
+from functools import lru_cache
+from concurrent.futures import ThreadPoolExecutor
+from astropy.table import Table
+from astropy.io import fits 
+from astropy.wcs import WCS
+from astropy.visualization import PercentileInterval, AsinhStretch
+import requests
+from PIL import Image
+from io import BytesIO
+import time as Time 
+
+
+fig_width_pt = 240.0  # Get this from LaTeX using \showthe\columnwidth
+inches_per_pt = 1.0/72.27			   # Convert pt to inches
+golden_mean = (np.sqrt(5)-1.0)/2.0		 # Aesthetic ratio
+fig_width = fig_width_pt*inches_per_pt  # width in inches
+
+
+session = requests.Session()
+
+@lru_cache(maxsize=128)
+
+def _Get_images(ra,dec,filters):
+    """Query ps1filenames.py service to get a list of images"""
+    service = "https://ps1images.stsci.edu/cgi-bin/ps1filenames.py"
+    url = f"{service}?ra={ra}&dec={dec}&filters={filters}"
+    table = Table.read(url, format='ascii')
+    return table
+
+def _Get_url_wcs(ra, dec, size, filters, color=False):
+    """Get URL for images in the table"""
+    table = _Get_images(ra,dec,filters=filters)
+    url = (f"https://ps1images.stsci.edu/cgi-bin/fitscut.cgi?"
+            f"ra={ra}&dec={dec}&size={size}&format=fits")
+
+    # sort filters from red to blue
+    flist = ["yzirg".find(x) for x in table['filter']]
+    table = table[np.argsort(flist)]
+    if color:
+        if len(table) > 3:
+            # pick 3 filters
+            table = table[[0,len(table)//2,len(table)-1]]
+        for i, param in enumerate(["red","green","blue"]):
+            url = url + "&{}={}".format(param,table['filename'][i])
+    else:
+        urlbase = url + "&red="
+        url = []
+        for filename in table['filename']:
+            url.append(urlbase+filename)
+
+    return url
+
+def _Get_im(ra, dec, size,color):
+    """Get color image at a sky position"""
+    if color:
+        url = _Get_url_wcs(ra,dec,size=size,filters='grz',color=True)
+        fh = fits.open(url)
+        wcs = WCS(fh[0])
+        # r = requests.get(url)
+        # im = Image.open(BytesIO(r.content))
+        fim = fh[0].data
+        fim[np.isnan(fim)] = 0.0
+        # set contrast to something reasonable
+        transform = AsinhStretch() + PercentileInterval(99.5)
+        bfim = transform(fim)
+        # transform = AsinhStretch() + PercentileInterval(99.5)
+        # bfim = transform(im)
+        im = bfim
+        
+    else:
+        url = _Get_url_wcs(ra,dec,size=size,filters='i')
+        fh = fits.open(url[0])
+        wcs = WCS(fh[0])
+
+        fim = fh[0].data
+        # replace NaN values with zero for display
+        fim[np.isnan(fim)] = 0.0
+        # set contrast to something reasonable
+        transform = AsinhStretch() + PercentileInterval(99.5)
+        bfim = transform(fim)
+        im = bfim
+    return im,wcs
+
+def _Panstarrs_phot(ra,dec,size):
+
+    grey_im,wcsI = _Get_im(ra,dec,size=size*6,color=False)
+    colour_im,wcsGRZ = _Get_im(ra,dec,size=size*6,color=True)
+    wcsList = [wcsGRZ,wcsGRZ,wcsGRZ,wcsI]
+    plt.rcParams.update({'font.size':12})
+    fig,ax = plt.subplots(ncols=4,figsize=(3*fig_width,1*fig_width))
+    ax[2].imshow(grey_im,origin="lower",cmap="gray")
+    ax[2].set_title('PS1 i')
+    ax[2].set_xlabel('px (0.25")')
+    ax[3].imshow(colour_im[0],origin="lower",cmap="gray")
+    ax[3].set_title('PS1 z')
+    ax[3].set_xlabel('px (0.25")')
+    ax[1].imshow(colour_im[1],origin="lower",cmap="gray")
+    ax[1].set_title('PS1 r')
+    ax[1].set_xlabel('px (0.25")')
+    ax[0].set_title('PS1 g')
+    ax[0].imshow(colour_im[2],origin="lower",cmap="gray")
+    ax[0].set_xlabel('px (0.25")')
+    return fig,wcsList,grey_im.shape[0],colour_im[1]
+
+def _skymapper_objects(ra,dec,imshape,wcs,rad=60):
+    rad /= 60**2 
+    query = f'https://skymapper.anu.edu.au/sm-cone/public/query?RA={ra}&DEC={dec}&SR={np.round(rad,3)}&RESPONSEFORMAT=CSV'
+    sm = pd.read_csv(query)
+    if len(sm) > 0:
+        keep = ['object_id','raj2000','dej2000','u_psf', 'e_u_psf',
+                'v_psf', 'e_v_psf','g_psf', 'e_g_psf','r_psf', 
+                'e_r_psf','i_psf', 'e_i_psf','z_psf', 'e_z_psf','class_star']
+        sm = sm[keep]
+        sm = sm.rename(columns={'raj2000':'ra','dej2000':'dec','u_psf':'umag',
+                                'v_psf':'vmag','g_psf':'gmag','r_psf':'rmag',
+                                'i_psf':'imag','z_psf':'zmag',
+                                'e_u_psf':'e_umag','e_v_psf':'e_vmag','e_g_psf':'e_gmag',
+                                'e_r_psf':'e_rmag','e_i_psf':'e_imag','e_z_psf':'e_zmag'})
+        sm['star'] = 0
+        sm['star'].loc[sm['class_star'] >= 0.9] = 1
+        sm['star'].loc[sm['class_star'] <= 0.7] = 0
+        sm['star'].loc[(sm['class_star'] > 0.7) & (sm['class_star'] < 0.9)] = 2
+    else:
+        sm = None
+
+        
+
+def _Skymapper_phot(ra,dec,size):
+    """Gets g,r,i from skymapper."""
+    size*=1.1
+    og_size = size
+    size /= 3600
+    url = f"https://api.skymapper.nci.org.au/public/siap/dr4/query?POS={ra},{dec}&SIZE={size}&BAND=g,r,i&FORMAT=GRAPHIC&VERB=3&INTERSET=COVERS"
+    max_attempts = 5
+    for attempt in range(max_attempts):
+        try:
+            table = Table.read(url, format='ascii').to_pandas()
+            break
+        except Exception:
+            if attempt == max_attempts -1:
+                raise
+    t = table[(table['col16'] == 'main')]
+    t_unique = t[~t.duplicated(subset='col3', keep='first')]
+    wcsList = []        
+    images = []
+    filts = ['g','r','i']
+
+    def fetch_band(band):
+        try:
+            f = t_unique.loc[t_unique['col3'] == band].iloc[0]
+            r = session.get(f['col4'], timeout=15)
+            r.raise_for_status()
+            im = (Image.open(BytesIO(r.content))) * 10 ** ((f['col22'] - 25) / -2.5)
+            im = np.array(im, dtype=float)
+            im[im == 0] = np.nan
+            im -= np.nanmedian(im)
+            im[np.isnan(im)] = 0
+            crpix = np.array(f['col23'].split(' ')).astype(float)
+            crval = np.array(f['col24'].split(' ')).astype(float)
+            cdmatrix = np.array(f['col25'].split(' ')).astype(float).reshape(2, 2)
+            wcs = WCS(naxis=2)
+            wcs.wcs.crpix, wcs.wcs.crval, wcs.wcs.cd = crpix, crval, cdmatrix
+            wcs.wcs.ctype = ["RA---TAN", "DEC--TAN"]  # Common projection type for celestial coordinates
+            return band, im, wcs
+        except Exception:
+            return band, None, None
+
+    with ThreadPoolExecutor(max_workers=3) as ex:
+        results = list(ex.map(fetch_band, filts))
+
+    for _, im, wcs in results:
+        if im is not None and wcs is not None:
+            images.append(im)
+            wcsList.append(wcs)
+    return wcsList,og_size*2,images[1]
+
+@lru_cache(maxsize=256)
+def _delve_objects(ra, dec, size=10/3600): #HERE IS WHERE I HAVE HARD CODED THE RADIUS CUTOFF
+    from dl import queryClient as qc
+    import numpy as np
+    import pandas as pd
+    import time
+
+    ra_str = f"{float(ra):.8f}"
+    dec_str = f"{float(dec):.8f}"
+    size_str = f"{float(size):.8f}"
+
+    query = f"""
+        SELECT o.quick_object_id, o.ra, o.dec,
+               o.mag_psf_g, o.mag_psf_r, o.mag_psf_i, o.mag_psf_z,
+               o.mag_auto_g, o.mag_auto_r, o.mag_auto_i, o.mag_auto_z,
+               o.magerr_psf_g, o.magerr_psf_r, o.magerr_psf_i, o.magerr_psf_z,
+               o.magerr_auto_g, o.magerr_auto_r, o.magerr_auto_i, o.magerr_auto_z,
+               o.extended_class_g, o.extended_class_r, o.extended_class_i, o.extended_class_z
+        FROM delve_dr2.objects AS o
+        WHERE q3c_radial_query(o.ra, o.dec, {ra_str}, {dec_str}, {size_str})
+    """
+
+    #print("SQL QUERY:\n", query)
+    max_attempts = 5
+    # Retry a few times - had crashed before
+    for attempt in range(max_attempts):
+        try:
+            result = qc.query(sql=query, fmt='pandas')
+            if result is None or len(result) == 0:
+                return None
+
+            result.replace(99.0, np.nan, inplace=True)
+            val = result[['extended_class_g','extended_class_r','extended_class_i','extended_class_z']].values
+            ty = [1 if 1 in v else 0 if 3 in v else 2 for v in val]
+            result['star'] = ty
+            result = result.rename(columns={'mag_psf_g':'gmag','mag_psf_r':'rmag','mag_psf_i':'imag','mag_psf_z':'zmag','magerr_psf_g':'e_gmag','magerr_psf_r':'e_rmag','magerr_psf_i':'e_imag','magerr_psf_z':'e_zmag'})
+            return result
+        except Exception as e:
+            print(f"Attempt {attempt+1} failed: {e}")
+            #time.sleep(2 * (attempt+1))
+        print("All attempts to query Delve failed.")
+    return None
+
+
+
+
+def _DESI_phot(ra, dec, size):
+    fig = None
+    size = size * 5
+    urlFITS = f"http://legacysurvey.org/viewer/cutout.fits?ra={ra}&dec={dec}&size={size}&layer=ls-dr10"
+    urlIM   = f"http://legacysurvey.org/viewer/cutout.jpg?ra={ra}&dec={dec}&size={size}&layer=ls-dr10"
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        fut_im = ex.submit(session.get, urlIM, timeout=20)
+        fut_fits = ex.submit(session.get, urlFITS, timeout=20)
+        r_im, r_fits = fut_im.result(), fut_fits.result()
+    if r_im.status_code != 200:
+        return None, None, None
+    image = Image.open(BytesIO(r_im.content))
+    try:
+        hdulist = fits.open(BytesIO(r_fits.content), ignore_missing_simple=True)
+        hdu = hdulist[0]
+        wcs = WCS(hdu.header).dropaxis(2)
+        plt.rcParams.update({'font.size':12})
+        fig = plt.figure(figsize=(8,8))#3*fig_width,1*fig_width))
+        ax = plt.subplot(111,projection=wcs)
+        ax.imshow(image)
+        ax.set_title('DES gri')
+        ax.grid(alpha=0.2)
+        ax.set_xlabel('Right Ascension')
+        ax.set_ylabel('Declination')
+        ax.invert_xaxis()
+        return fig, wcs, size, image
+    except Exception as e:
+        print("DES Photometry failed:", e)
+        return None, None, None
+
+
+def simbad_sources(ra,dec,size):
+    from astroquery.simbad import Simbad
+    simbad = Simbad()
+    simbad.ROW_LIMIT = -1
+    gal_query = f"""SELECT ra, dec, main_id, otype
+
+                    FROM basic
+
+                    WHERE otype != 'star..'
+
+                    AND CONTAINS(POINT('ICRS', basic.ra, basic.dec), CIRCLE('ICRS', {ra}, {dec} , {size})) = 1
+                """
+    gal = simbad.query_tap(gal_query)
+    gal = gal.to_pandas()
+    star_query = f"""SELECT ra, dec, main_id, otype
+
+                    FROM basic
+
+                    WHERE otype = 'star..'
+
+                    AND CONTAINS(POINT('ICRS', basic.ra, basic.dec), CIRCLE('ICRS', {ra}, {dec} , {size})) = 1
+                 """
+    stars = simbad.query_tap(star_query)
+    stars = stars.to_pandas()
+    gal['star'] = 0
+    stars['star'] = 1
+    sbad = pd.concat([stars,gal])
+    return sbad
+
+def check_simbad(cat,sbad):
+    dist = np.sqrt((sbad['ra'].values[:,np.newaxis] - cat['ra'].values[np.newaxis,:])**2 + (sbad['dec'].values[:,np.newaxis] - cat['dec'].values[np.newaxis,:])**2)*60**2
+    sind, catind = np.where(dist<5)
+    cat['otype'] = 'none'
+    if len(catind) > 0:
+        cat.loc[catind,'star'] = sbad.loc[sind,'star'].values
+        cat.loc[catind,'otype'] = sbad.loc[sind,'otype'].values
+    return cat
+
+def get_gaia(ra,dec,size):
+    from astroquery.gaia import Gaia
+    import astropy.units as u
+    Gaia.ROW_LIMIT = -1  # Ensure the default row limit.
+    coord = SkyCoord(ra=ra, dec=dec, unit=(u.degree, u.degree), frame='icrs')
+    j = Gaia.cone_search_async(coord, radius=u.Quantity(20, u.arcsec)) #Changed to 20 arcseconds from 100
+    j = j.get_results().to_pandas()
+    j['star'] = 1
+    j.loc[(j['classprob_dsc_combmod_quasar'] > 0.7) | (j['classprob_dsc_combmod_galaxy'] > 0.7),'star'] = 2
+    j.loc[(j['classprob_dsc_combmod_quasar'] > 0.9) | (j['classprob_dsc_combmod_galaxy'] > 0.9),'star'] = 0
+    return j
+
+def check_gaia(cat,gaia):
+    dist = np.sqrt((gaia['ra'].values[:,np.newaxis] - cat['ra'].values[np.newaxis,:])**2 + (gaia['dec'].values[:,np.newaxis] - cat['dec'].values[np.newaxis,:])**2)*60**2
+    gind, catind = np.where(dist<5)
+    cat['dist'] = np.nan
+    cat['dist_l'] = np.nan
+    cat['dist_u'] = np.nan
+    if len(catind) > 0:
+        cat.loc[catind,'star'] = gaia.loc[gind,'star'].values
+        cat.loc[catind,'dist'] = gaia.loc[gind,'distance_gspphot'].values
+        cat.loc[catind,'dist_l'] = gaia.loc[gind,'distance_gspphot_lower'].values
+        cat.loc[catind,'dist_u'] = gaia.loc[gind,'distance_gspphot_upper'].values
+    return cat
+
+
+def _add_sources(fig,coords,cat,error=None):
+    axs = fig.get_axes()
+    count = 0
+    for ax in axs:
+        ax.scatter(coords[0],coords[1], transform=ax.get_transform('fk5'),
+                    facecolors='w',marker='x',s=30,linewidths=1,label='Target')
+        if error is not None:
+            if len(error) > 1:
+                xerr,yerr = error
+            else:
+                xerr = yerr = error
+            ellipse = Ellipse(xy=(coords[0],coords[1]),  
+                              width=error[0],height=error[1],     
+                              edgecolor='white',facecolor='none',
+                              linestyle=':', linewidth=2,
+                              transform=ax.get_transform('fk5'))
+            ax.add_patch(ellipse)
+        
+        # scatter stars 
+        stars = cat.loc[cat['star'] == 1]
+        ax.scatter(stars.ra,stars.dec, transform=ax.get_transform('fk5'),
+                    edgecolors='w',marker='^',s=80,facecolors="None",linewidths=1,label='Star')
+
+        # scatter galaxies
+        gal = cat.loc[cat['star'] == 0]
+        ax.scatter(gal.ra,gal.dec, transform=ax.get_transform('fk5'),
+                    edgecolors='w',marker='o',s=80,facecolors="None",label='Galaxy')
+        
+        # scatter other
+        gal = cat.loc[cat['star'] == 2]
+        ax.scatter(gal.ra,gal.dec, transform=ax.get_transform('fk5'),
+                    edgecolors='w',marker='D',s=80,facecolors="None",label='Possible galaxy')
+        if count == 0:
+            legend = ax.legend(loc=2,facecolor="black",fontsize=10)
+            for text in legend.get_texts():
+                text.set_color("white")
+        count += 1
+    return fig
+  
+
+
+def event_cutout(coords, error=None, size=100, phot=None, check='gaia'):
+    ra = coords[0][0] if isinstance(coords[0], list) else coords[0]
+    dec = coords[1][0] if isinstance(coords[1], list) else coords[1]
+    if phot is None:
+        returns = _DESI_phot(ra, dec, size) #, image #HERE IS WHERE THE DES IMAGE IS PRINTING - TAKES A BUNCH OF TIME
+        if len(returns) == 4:
+            fig, wcs, outsize, image = returns
+            plt.close(fig)
+        elif len(returns) == 3:
+            fig, wcs, outsize = returns
+            image = None
+        else:
+            raise ValueError(f"_DESI_phot returned unexpected number of values: {len(returns)}")
+        if fig is None:
+            if dec > -10:
+                phot = 'ps1'
+                print("ps1")
+            else:
+                phot = 'skymapper'
+                print("Searching Skymapper")
+        else:
+            phot = 'decam'
+            cat = _delve_objects(ra, dec)
+            print("Searching DECam")
+    if phot.lower() == 'ps1':
+        fig,wcs,outsize,image = _Panstarrs_phot(ra,dec,size)
+        cat = None
+        fig = _add_sources(fig,coords,cat,error)
+    elif phot.lower() == 'skymapper':
+        fig,wcs,outsize,image = _Skymapper_phot(ra,dec,size)
+        cat = _skymapper_objects(ra,dec)
+        fig = _add_sources(fig,coords,cat,error)
+    elif phot is None:
+        print('Photometry name invalid.')
+        fig = None
+        wcs = None
+    if phot is not None:
+        if check == 'simbad':
+            sbad = simbad_sources(ra,dec,size/(60**2))
+            print("Checking SIMBAD")
+            cat = check_simbad(cat,sbad)
+        elif check == 'gaia':
+            gaia = get_gaia(ra,dec,size/(60**2))
+            print("Checking Gaia")
+            cat = check_gaia(cat,gaia)
+    else:
+        if check == 'simbad':
+            cat = simbad_sources(ra,dec,size/(60**2))
+            print("Checking SIMBAD")
+        elif check == 'gaia':
+            cat = get_gaia(ra,dec,size/(60**2))
+            print("Checking Gaia")
+
+    return fig,wcs,outsize, phot, cat, image
+
+
+def identifier_creator(source, filename):
+	data = pd.read_csv(filename, names=["time_MJD", "counts", "event_flag"], skiprows=1).apply(pd.to_numeric, errors='coerce')
+	event_data = data[data["event_flag"] != 0.0]
+	MJD = event_data["time_MJD"].iloc[0]
+
+	source_ra, source_dec = source[2], source[3]
+
+	coord = SkyCoord(ra=source_ra*u.degree, dec=source_dec*u.degree, frame='icrs')
+	angle_source_ra = coord.ra.to_string(unit=u.hour, sep=':', precision=0, pad=True)[:5]
+	angle_source_dec = coord.dec.to_string(unit=u.degree, sep=':', precision=0, alwayssign=True, pad=True)[:6]
+
+	# Adjust MJD precision to 5 characters
+	MJD = f"{MJD:.0f}"
+
+
+	identifier = "TSS_J" + angle_source_ra + angle_source_dec +"T" + MJD 
+	return identifier
+
+class prob_association:
+    def __init__(self, ra, dec, era=None, edec=None, lc=None, verbose=1, zp=25):
+        self.ra = np.array(ra)
+        self.dec = np.array(dec)
+        self.era = era
+        self.edec = edec
+        self.lc = np.array(lc) if lc is not None else None
+        self.verbose = verbose
+
+        self._check_params()
+
+    def _check_params(self):
+        if (len(self.ra) != len(self.dec)):
+            raise ValueError('ra and dec must be the same length')
+        if (self.lc is None) & (self.verbose > 0):
+            print('No lightcurve specified')
+        else:
+            if (len(self.ra) != len(self.lc)):
+                m = f'The coordinates and lc must have the same length\n len(ra)={len(self.ra)}\nlen(lc)={len(self.lc)}'
+                raise ValueError(m)
+        if self.era is None:
+            m = "No positional error provided, assuming an error of 5''"
+            print(m)
+            self.era = np.ones_like(self.ra) * 5
+            self.edec = np.ones_like(self.ra) * 5
+
+    def get_external(self, ra=None, dec=None, pos_error=None, index=None, imsize=100):
+        if ra is None:
+            ra = self.ra
+            dec = self.dec
+        if pos_error is None:
+            warnings.warn("Positional error assumed to be 20 arcseconds")
+            pos_error = [self.era, self.edec] #This is the assumed 5 arcsecond position error from check_params
+        fig = wcs = outsize = phot = cat = image = None
+        if len(ra) > 1:
+            if index is None:
+                m = '!! Only 1 coordinate can be queried, and no index is set.\nSetting index = 0 !!'
+                warnings.warn(m)
+                index = 0
+            ra = ra[index]
+            dec = dec[index]
+            pos_error = pos_error[index]
+        coords = [ra, dec]
+        try:
+            fig, wcs, outsize, phot, cat, image = event_cutout(coords, error=pos_error, size=imsize)
+        except Exception as e:
+            warnings.warn(f"event_cutout failed due to: {e}")
+            fig, wcs, outsize, phot, cat, image = None, None, None, None, None, None
+        if cat is not None:
+            try:
+                cat['g-r'] = cat['gmag'] - cat['rmag']
+            except Exception:
+                pass
+        self.phot_wcs = wcs
+        self.fig = fig
+        self.instrument = phot
+        self.cat = cat
+        return cat
+
+
+    def _compute_distance_prob(self, index=None):
+        if self.cat is None:
+            print('No catalog is specified')
+        if len(self.ra) > 1:
+            if index is None:
+                m = '!! Only 1 coordinate can be queried, and no index is set.\nSetting index = 0 !!'
+                warnings.warn(m)
+                index = 0
+        ra = self.ra[index]
+        dec = self.dec[index]
+        era = self.era[index]
+        edec = self.edec[index]
+        dist = np.sqrt((ra - self.cat['ra'].values) ** 2 + (dec - self.cat['dec'].values) ** 2)
+        dra = ((ra - self.cat['ra'].values) / era) ** 2
+        ddec = ((dec - self.cat['dec'].values) / edec) ** 2
+        sig = np.exp(-0.5 * (dra + ddec))
+        self.cat['dist'] = dist
+        self.cat['dist_sig'] = sig
+
+
+def cat_probs(pa, search_radius, index=None):
+    if pa.cat is None:
+        warnings.warn("No catalog attached to prob_association.")
+        return pd.DataFrame(columns=["ra", "dec", "star", "dist", "dist_sig", "probability"])
+    if len(pa.cat) == 0:
+        warnings.warn("Catalog is empty.")
+        pa.cat["probability"] = []
+        return pa.cat.copy()
+    pa._compute_distance_prob(index=index)
+    distances_arcsec = pa.cat["dist"].values * 3600.0 
+    probs = 1.0 - (distances_arcsec / (search_radius+0.1)) #To keep a chance at the search radius
+    weights = np.ones(len(pa.cat))
+    weights[pa.cat["star"] == 1] = 1.1 # star = 1 -> confirmed star, give 10% boost
+    weights[pa.cat["star"] == 0] = 1.0 # star = 0 -> galaxy
+    weights[pa.cat["star"] == 2] = 1.0 # star = 2 -> uncertain
+    probs = probs * weights
+    probs = np.clip(probs, 0.0, 1.0)  # Keep between 0 and 1
+    pa.cat["probability"] = probs
+    return pa.cat.copy()
+
+def find_distance(source, event_ra, event_dec):
+    # Extract the position data
+    coords = SkyCoord(source[1], source[2], unit="deg", frame="icrs")
+    event_sky_pos = SkyCoord(event_ra, event_dec, unit="deg", frame="icrs")
+    # Calculate the distance
+    separation = coords.separation(event_sky_pos)
+    distance = separation.arcsecond
+    return distance
+
+"""All the code below this part was in a separate cell. It reads data from an excel file (must give it the correct path), 
+makes a copy of the file and write to it, just incase something has messed up."""
+
+import pandas as pd
+import shutil
+import os
+
+def distance_probability(ra_list, dec_list, era, edec, search_radius, input_excel_path):
+    if not isinstance(era, (list, tuple)):
+        era = [era] * len(ra_list)
+    if not isinstance(edec, (list, tuple)):
+        edec = [edec] * len(dec_list)
+    results = []
+    confidence_flags = []
+    flagged_objects = []
+    for i, (ra, dec, ra_err, dec_err) in enumerate(zip(ra_list, dec_list, era, edec)):
+        print(f"\nProcessing coordinate {i+1}/{len(ra_list)}: RA={ra}, Dec={dec}")
+        pa = prob_association([ra], [dec], era=[ra_err], edec=[dec_err])
+        pa.get_external(ra=[ra], dec=[dec], pos_error=[[ra_err, dec_err]], index=0, imsize=100)
+        cat = cat_probs(pa, search_radius, index=0)
+        if len(cat) == 0:
+            print("No objects found in catalog.")
+            results.append(None)
+            confidence_flags.append(0)
+            continue
+
+        cat = cat[cat["dist"] * 3600 <= search_radius]  # deg -> arcsec
+        if len(cat) == 0:
+            print(f"No objects found within {search_radius}\"")
+            results.append(None)
+            confidence_flags.append(0)
+            continue
+
+        sorted_cat = cat.sort_values("probability", ascending=False)
+        top_2_matches = sorted_cat.head(2)
+        print("Top 2 matches:")
+        print(top_2_matches[["ra", "dec", "star", "dist", "dist_sig", "probability"]])
+
+        best_match = top_2_matches.iloc[0]
+        best_ra = best_match["ra"]
+        best_dec = best_match["dec"]
+        most_probable = best_match["probability"]
+
+        confidence_flag = 1 if most_probable > 0.70 else 0
+        if most_probable > 0.70:
+            print(f"Confident: An object at {best_ra:.6f}, {best_dec:.6f} has >70% probability of being the match.")
+        else:
+            if len(top_2_matches) > 1:
+                prob_diff = abs(top_2_matches.iloc[0]["probability"] - top_2_matches.iloc[1]["probability"])
+                if prob_diff <= 0.10:
+                    print("Multiple possible contributors with similar probability.")
+                else:
+                    print("Flag: No object >70% probability. Needs further investigation.")
+                    flagged_objects.append({"ra": ra, "dec": dec, "most_likely_objects": top_2_matches.iloc[0].to_dict()})
+            else:
+                print("Flag: No object >70% probability. Needs further investigation.")
+                flagged_objects.append({"ra": ra, "dec": dec, "most_likely_objects": top_2_matches.iloc[0].to_dict()})
+        results.append(top_2_matches)
+        confidence_flags.append(confidence_flag)
+
+    append_results_to_excel(input_excel_path, results, confidence_flags)
+    print("\n Excel file updated successfully.")
+    return results, flagged_objects
+
+
+def append_results_to_excel(input_excel_path, results, confidence_flags):
+    """Creates a copy of the Excel file first."""
+    base, ext = os.path.splitext(input_excel_path)
+    output_excel_path = f"{base}_with_probabilities{ext}"
+
+    shutil.copy(input_excel_path, output_excel_path)
+    print(f"\n Backup created at: {output_excel_path}")
+
+    df = pd.read_excel(output_excel_path)
+
+    # Add top 2 object info
+    for i in range(2):
+        df[f"Possible Object {i+1} RA"] = [res.iloc[i]["ra"] if res is not None and len(res) > i else None for res in results]
+        df[f"Possible Object {i+1} Dec"] = [res.iloc[i]["dec"] if res is not None and len(res) > i else None for res in results]
+        df[f"Possible Object {i+1} Star"] = [res.iloc[i]["star"] if res is not None and len(res) > i else None for res in results]
+        df[f"Possible Object {i+1} Mag (r)"] = [res.iloc[i]["rmag"] if res is not None and "rmag" in res.columns and len(res) > i else None for res in results]
+        df[f"Possible Object {i+1} Probability"] = [res.iloc[i]["probability"] if res is not None and len(res) > i else None for res in results]
+
+    df["Confidence Flag"] = confidence_flags
+
+    df.to_excel(output_excel_path, index=False)
+    print("Results written to:", output_excel_path)
+
+#Main section
+input_excel_path = r"C:\Users\lmf53\OneDrive - University of Canterbury\2025\ASTR381\Project\Sector Data and Probabilities\Sector 31.xlsx"
+df = pd.read_excel(input_excel_path)
+ra = df.iloc[:, 18].tolist()
+dec = df.iloc[:, 19].tolist()
+era = 2.0
+edec = 2.0
+search_radius = 10 #Need to change the hard coded value in the function _delve_objects
+
+distance_probability(ra, dec, era, edec, search_radius, input_excel_path)
